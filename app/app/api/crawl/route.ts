@@ -1,22 +1,15 @@
 import { NextRequest } from "next/server"
-import { crawlWebsite } from "@/lib/crawler"
+import { crawlWebsite, expandDomain, expandPath } from "@/lib/crawler"
 import { cacheResult, generateCrawlId } from "@/lib/cache"
-import { CrawlEvent } from "@/lib/types"
+import { CrawlEvent, CrawlResult } from "@/lib/types"
 
 export const maxDuration = 120
 
 export async function POST(req: NextRequest) {
-  const { url } = await req.json()
-
-  if (!url || typeof url !== "string") {
-    return new Response(JSON.stringify({ error: "URL is required" }), {
-      status: 400,
-      headers: { "Content-Type": "application/json" },
-    })
-  }
+  const body = await req.json()
 
   const encoder = new TextEncoder()
-  const crawlId = generateCrawlId()
+  const crawlId = body.crawlId || generateCrawlId()
 
   const stream = new ReadableStream({
     async start(controller) {
@@ -25,8 +18,41 @@ export async function POST(req: NextRequest) {
       }
 
       try {
-        const result = await crawlWebsite(url, send)
+        let result: CrawlResult
+
+        if (body.expandDomain) {
+          const { domain, parentDomain, currentDepth, maxDepth } = body.expandDomain
+          result = await expandDomain(
+            domain,
+            parentDomain || null,
+            currentDepth || 0,
+            maxDepth || 1,
+            crawlId,
+            send
+          )
+        } else if (body.expandPath) {
+          const { url, domain, parentDomain, currentDepth, maxDepth } = body.expandPath
+          result = await expandPath(
+            url,
+            domain,
+            parentDomain || null,
+            currentDepth || 0,
+            maxDepth || 1,
+            crawlId,
+            send
+          )
+        } else {
+          const { url, maxDepth } = body
+          if (!url || typeof url !== "string") {
+            send({ type: "error", message: "URL is required" })
+            controller.close()
+            return
+          }
+          result = await crawlWebsite(url, maxDepth || 1, send)
+        }
+
         cacheResult(crawlId, result)
+        send({ type: "update", nodes: result.nodes, edges: result.edges })
         send({ type: "complete", crawlId })
       } catch (err) {
         const message = err instanceof Error ? err.message : "Crawl failed unexpectedly"

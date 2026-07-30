@@ -3,6 +3,8 @@ import { getCachedResult } from "@/lib/cache"
 
 export async function GET(req: NextRequest) {
   const id = req.nextUrl.searchParams.get("id")
+  console.log(`[RESULT API] GET /api/crawl/result?id=${id}`)
+
   if (!id) {
     return new Response(JSON.stringify({ error: "Missing id parameter" }), {
       status: 400,
@@ -18,7 +20,11 @@ export async function GET(req: NextRequest) {
     })
   }
 
+  const nodeCount = Object.keys(result.nodes || {}).length
+  const edgeCount = (result.edges || []).length
+
   return new Response(JSON.stringify(result), {
+    status: 200,
     headers: { "Content-Type": "application/json" },
   })
 }

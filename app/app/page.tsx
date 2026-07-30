@@ -9,6 +9,7 @@ import { CrawlEvent } from "@/lib/types"
 export default function Home() {
   const router = useRouter()
   const [url, setUrl] = useState("")
+  const [maxDepth, setMaxDepth] = useState(1)
   const [crawling, setCrawling] = useState(false)
   const [progress, setProgress] = useState({
     domainsDiscovered: 0,
@@ -27,7 +28,7 @@ export default function Home() {
       const response = await fetch("/api/crawl", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url: normalize(url.trim()) }),
+        body: JSON.stringify({ url: normalize(url.trim()), maxDepth }),
       })
 
       if (!response.ok) {
@@ -59,7 +60,8 @@ export default function Home() {
               })
             } else if (event.type === "complete") {
               const domain = extractDomain(normalize(url.trim()))
-              router.push(`/graph?crawlId=${event.crawlId}&domain=${encodeURIComponent(domain)}`)
+              console.log(`[HOME] Crawl complete. Navigating to /graph with crawlId=${event.crawlId}, domain=${domain}`)
+              router.push(`/graph?crawlId=${event.crawlId}&domain=${encodeURIComponent(domain)}&maxDepth=${maxDepth}`)
               return
             } else if (event.type === "error") {
               setError(event.message)
@@ -75,7 +77,7 @@ export default function Home() {
       setError(err instanceof Error ? err.message : "Crawl failed")
       setCrawling(false)
     }
-  }, [url, router])
+  }, [url, maxDepth, router])
 
   return (
     <div className="min-h-dvh flex flex-col items-center justify-center px-4">
@@ -127,6 +129,25 @@ export default function Home() {
           </div>
         </div>
 
+        <div className="flex items-center justify-center gap-2">
+          <Layers className="w-4 h-4 text-text-muted" />
+          <span className="text-sm text-text-secondary">Max Crawl Depth:</span>
+          {[1, 2, 3].map((d) => (
+            <button
+              key={d}
+              onClick={() => !crawling && setMaxDepth(d)}
+              disabled={crawling}
+              className={`px-3 py-1.5 text-sm font-medium rounded-lg transition-colors ${
+                maxDepth === d
+                  ? "bg-accent text-white"
+                  : "bg-bg-surface text-text-secondary hover:text-text-primary border border-border"
+              } disabled:opacity-50`}
+            >
+              {d}
+            </button>
+          ))}
+        </div>
+
         {error && (
           <div className="bg-error/10 border border-error/20 rounded-lg px-4 py-3 text-sm text-error">
             {error}
@@ -154,7 +175,7 @@ export default function Home() {
               </div>
               <div className="text-center space-y-1">
                 <div className="text-2xl font-semibold text-text-primary">
-                  {progress.currentDepth}/3
+                  {progress.currentDepth}/{maxDepth}
                 </div>
                 <div className="text-xs text-text-muted">Depth</div>
               </div>
@@ -163,7 +184,7 @@ export default function Home() {
               <div
                 className="h-full bg-accent rounded-full transition-all duration-500"
                 style={{
-                  width: `${Math.min(100, (progress.currentDepth / 3) * 100)}%`,
+                  width: `${Math.min(100, (progress.currentDepth / maxDepth) * 100)}%`,
                 }}
               />
             </div>

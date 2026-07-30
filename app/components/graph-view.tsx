@@ -11,7 +11,9 @@ interface GraphViewProps {
   searchQuery: string
   domainFilter: "all" | "internal" | "external"
   depthFilter: number
-  onNodeSelect: (domain: string | null) => void
+  onNodeContextMenu: (domain: string, x: number, y: number) => void
+  onBackgroundTap: () => void
+  onNodeTap: (domain: string) => void
 }
 
 const depthColors: Record<number, string> = {
@@ -21,9 +23,6 @@ const depthColors: Record<number, string> = {
   3: "#ec4899",
 }
 
-const MIN_NODE_SIZE = 20
-const MAX_NODE_SIZE = 50
-
 export default function GraphView({
   nodes,
   edges,
@@ -31,178 +30,223 @@ export default function GraphView({
   searchQuery,
   domainFilter,
   depthFilter,
-  onNodeSelect,
+  onNodeContextMenu,
+  onBackgroundTap,
+  onNodeTap,
 }: GraphViewProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const cyRef = useRef<Core | null>(null)
+  const onNodeTapRef = useRef(onNodeTap)
+  const onNodeContextMenuRef = useRef(onNodeContextMenu)
+  const onBackgroundTapRef = useRef(onBackgroundTap)
+  const rootDomainRef = useRef(rootDomain)
+  onNodeTapRef.current = onNodeTap
+  onNodeContextMenuRef.current = onNodeContextMenu
+  onBackgroundTapRef.current = onBackgroundTap
+  rootDomainRef.current = rootDomain
 
-  const filteredElements = useCallback(() => {
-    const rootParts = rootDomain.split(".").slice(-2).join(".")
-    const filteredNodeDomains = new Set<string>()
+  const graphElements = useCallback(() => {
+    try {
+      const rootParts = rootDomain.split(".").slice(-2).join(".")
+      const nodeValues = Object.values(nodes || {})
+      const filteredNodes = nodeValues.filter((n) => {
+        if (!n) return false
+        if (n.depth > depthFilter) return false
+        if (domainFilter === "internal" && !n.domain.includes(rootParts)) return false
+        if (domainFilter === "external" && n.domain.includes(rootParts)) return false
+        if (searchQuery && !n.domain.toLowerCase().includes(searchQuery.toLowerCase())) return false
+        return true
+      })
 
-    const nodeList = Object.values(nodes).filter((n) => {
-      if (n.depth > depthFilter) return false
+      const nodeSet = new Set(filteredNodes.map(n => n.domain))
+      const elements: cytoscape.ElementDefinition[] = []
 
-      if (domainFilter === "internal") {
-        if (!n.domain.includes(rootParts)) return false
-      } else if (domainFilter === "external") {
-        if (n.domain.includes(rootParts)) return false
-      }
+      for (const n of filteredNodes) {
+        if (!n) continue
+        const isRoot = n.domain === rootDomain
+        const totalBacklinkPages = Object.values(n.subdomains || {}).reduce(
+          (sum, c) => sum + (c?.backlinkPages?.length || 0), 0
+        )
 
-      if (searchQuery && !n.domain.toLowerCase().includes(searchQuery.toLowerCase())) {
-        return false
-      }
-
-      filteredNodeDomains.add(n.domain)
-      return true
-    })
-
-    const edgeList = edges.filter(
-      (e) => filteredNodeDomains.has(e.source) && filteredNodeDomains.has(e.target)
-    )
-
-    const elements: cytoscape.ElementDefinition[] = [
-      ...nodeList.map((n) => {
-        const nodeCount = Object.keys(nodes).length
-        const size =
-          MIN_NODE_SIZE +
-          (MAX_NODE_SIZE - MIN_NODE_SIZE) *
-            (1 - (n.depth / 3))
-
-        return {
+        elements.push({
           data: {
             id: n.domain,
             domain: n.domain,
             depth: n.depth,
-            linkCount: n.children.length,
+            linkCount: (n.children || []).length,
+            backlinkCount: totalBacklinkPages,
             parentDomain: n.parentDomain,
-            isRoot: n.domain === rootDomain,
+            isRoot,
           },
-          classes: n.domain === rootDomain ? "root" : "",
-          style: {
-            width: size,
-            height: size,
-          },
-        }
-      }),
-      ...edgeList.map((e) => ({
-        data: {
-          id: `${e.source}->${e.target}`,
-          source: e.source,
-          target: e.target,
-        },
-      })),
-    ]
+          classes: `node ${isRoot ? "root" : ""}`,
+          position: undefined,
+        })
+      }
 
-    return elements
+      const validEdges = edges.filter(e =>
+        nodeSet.has(e.source) && nodeSet.has(e.target)
+      )
+
+      const aggregated = new Map<string, { count: number }>()
+      for (const e of validEdges) {
+        const key = `${e.source}->${e.target}`
+        const existing = aggregated.get(key)
+        if (existing) {
+          existing.count += (e.paths || []).length
+        } else {
+          aggregated.set(key, { count: (e.paths || []).length })
+        }
+      }
+
+      for (const [key, data] of aggregated) {
+        const [src, tgt] = key.split("->")
+        elements.push({
+          data: {
+            id: key,
+            source: src,
+            target: tgt,
+            count: data.count,
+          },
+        })
+      }
+
+      const allNodeIds = new Set(elements.filter(e => e.data && !("source" in e.data)).map(e => e.data!.id!))
+      const finalElements: cytoscape.ElementDefinition[] = []
+      let droppedEdges = 0
+      for (const el of elements) {
+        if (el.data && "source" in el.data) {
+          const src = el.data.source
+          const tgt = el.data.target
+          if (!allNodeIds.has(src) || !allNodeIds.has(tgt)) {
+            droppedEdges++
+            continue
+          }
+        }
+        finalElements.push(el)
+      }
+      if (droppedEdges > 0) {
+        console.warn(`[GRAPH-VIEW] Dropped ${droppedEdges} edges referencing non-existent nodes`)
+      }
+
+      return finalElements
+    } catch (err) {
+      console.error("[GRAPH-VIEW] Error building elements:", err)
+      return []
+    }
   }, [nodes, edges, rootDomain, searchQuery, domainFilter, depthFilter])
 
   useEffect(() => {
     if (!containerRef.current) return
+    try {
+      const els = graphElements()
 
-    const elements = filteredElements()
+      const cy = cytoscape({
+        container: containerRef.current,
+        elements: els,
+        style: [
+          {
+            selector: "node",
+            style: {
+              "background-color": "#f0f0f0",
+              "border-width": 3,
+              "border-color": "#d0d0d0",
+              shape: "ellipse",
+              label: "data(domain)",
+              "text-valign": "center",
+              "text-halign": "center",
+              "font-size": 14,
+              "font-weight": "bold",
+              "font-family": "Geist Variable, system-ui, sans-serif",
+              color: "#1c1917",
+              "min-zoomed-font-size": 8,
+              "text-wrap": "wrap",
+              "text-max-width": "140",
+              width: 90,
+              height: 90,
+            },
+          },
+          {
+            selector: "node.root",
+            style: {
+              "border-color": "#2563eb",
+              "border-width": 4,
+              "background-color": "#eff6ff",
+            },
+          },
+          {
+            selector: "edge",
+            style: {
+              width: "mapData(count, 0, 20, 1, 6)",
+              "line-color": "#a8a29e",
+              "target-arrow-color": "#a8a29e",
+              "target-arrow-shape": "triangle",
+              "curve-style": "bezier",
+              "arrow-scale": 0.8,
+              "line-style": "dashed",
+            },
+          },
+          {
+            selector: "node:selected",
+            style: {
+              "border-width": 3,
+              "border-color": "#2563eb",
+              "background-color": "#eff6ff",
+            },
+          },
+        ],
+        layout: {
+          name: "cose",
+          animate: true,
+          animationDuration: 800,
+          animationEasing: "ease-out",
+          nodeRepulsion: () => 15000,
+          nodeOverlap: 4,
+          idealEdgeLength: () => 160,
+          edgeElasticity: () => 100,
+          gravity: 0.5,
+          numIter: 1000,
+          initialTemp: 1200,
+          coolingFactor: 0.99,
+          minTemp: 1,
+          fit: true,
+          padding: 60,
+        },
+        minZoom: 0.1,
+        maxZoom: 5,
+        wheelSensitivity: 0.3,
+        userZoomingEnabled: true,
+        userPanningEnabled: true,
+        boxSelectionEnabled: false,
+        selectionType: "single",
+      })
 
-    const cy = cytoscape({
-      container: containerRef.current,
-      elements,
-      style: [
-        {
-          selector: "node",
-          style: {
-            label: "data(domain)",
-            "text-valign": "center",
-            "text-halign": "center",
-            "font-size": 10,
-            "font-family": "Geist Variable, system-ui, sans-serif",
-            color: "#1c1917",
-            "background-color": "#e7e5e4",
-            "border-width": 0,
-            "text-wrap": "ellipsis",
-            "text-max-width": "120",
-            "text-margin-y": 16,
-            "min-zoomed-font-size": 8,
-          },
-        },
-        {
-          selector: "node.root",
-          style: {
-            "background-color": "#2563eb",
-            "border-width": 3,
-            "border-color": "#1d4ed8",
-          },
-        },
-        {
-          selector: "edge",
-          style: {
-            width: 1.5,
-            "line-color": "#d4d4d4",
-            "target-arrow-color": "#d4d4d4",
-            "target-arrow-shape": "triangle",
-            "curve-style": "bezier",
-            "arrow-scale": 0.6,
-          },
-        },
-        {
-          selector: "node:selected",
-          style: {
-            "border-width": 3,
-            "border-color": "#2563eb",
-            "background-color": "#eff6ff",
-            color: "#1c1917",
-          },
-        },
-        {
-          selector: "node.highlighted",
-          style: {
-            "border-width": 3,
-            "border-color": "#2563eb",
-          },
-        },
-        {
-          selector: "edge.highlighted",
-          style: {
-            "line-color": "#2563eb",
-            "target-arrow-color": "#2563eb",
-            width: 2.5,
-          },
-        },
-      ],
-      layout: {
-        name: "concentric",
-        concentric: (node: any) => node.data("depth"),
-        levelWidth: () => 1,
-        minNodeSpacing: 80,
-        padding: 60,
-        animate: true,
-        animationDuration: 800,
-        animationEasing: "ease-out",
-      },
-      minZoom: 0.3,
-      maxZoom: 5,
-      wheelSensitivity: 0.3,
-      userZoomingEnabled: true,
-      userPanningEnabled: true,
-      boxSelectionEnabled: false,
-      selectionType: "single",
-    })
+      cyRef.current = cy
 
-    cyRef.current = cy
+      cy.on("tap", "node", (evt: EventObject) => {
+        const domain = evt.target.data("domain")
+        onNodeTapRef.current(domain)
+      })
 
-    cy.on("tap", "node", (evt: EventObject) => {
-      const node = evt.target
-      const domain = node.data("domain")
-      onNodeSelect(domain || null)
-    })
+      cy.on("cxttap", "node", (evt: EventObject) => {
+        const node = evt.target
+        const d = node.data("domain")
+        const rp = node.renderedPosition()
+        const cr = containerRef.current!.getBoundingClientRect()
+        onNodeContextMenuRef.current(d, cr.left + rp.x, cr.top + rp.y)
+      })
 
-    cy.on("tap", (evt: EventObject) => {
-      if (evt.target === cy) {
-        onNodeSelect(null)
-      }
-    })
+      cy.on("tap", (evt: EventObject) => {
+        if (evt.target === cy) onBackgroundTapRef.current()
+      })
+      cy.on("cxttap", (evt: EventObject) => {
+        if (evt.target === cy) onBackgroundTapRef.current()
+      })
+    } catch (err) {
+      console.error("[GRAPH-VIEW] Init failed:", err)
+    }
 
     return () => {
-      cy.destroy()
-      cyRef.current = null
+      if (cyRef.current) { cyRef.current.destroy(); cyRef.current = null }
     }
   }, [])
 
@@ -210,35 +254,49 @@ export default function GraphView({
     const cy = cyRef.current
     if (!cy) return
 
-    const elements = filteredElements()
+    try {
+      const els = graphElements()
+      if (els.length === 0) return
 
-    const currentIds = new Set(cy.nodes().map((n) => n.id()))
-    const newIds = new Set(elements.filter((e) => "source" in e === false).map((e: any) => e.data.id))
+      const newElIds = new Set(els.map(e => e.data?.id).filter(Boolean) as string[])
 
-    const toRemove = cy.elements().filter((el) => !newIds.has(el.id()))
-    cy.remove(toRemove)
+      const toRemove = cy.elements().filter(el => !newElIds.has(el.id()))
+      const toAdd = els.filter(el => !el.data?.id || !cy.getElementById(el.data.id).length)
 
-    const toAdd = elements.filter((el) => !currentIds.has(el.data.id!))
-    cy.add(toAdd)
+      if (toRemove.length > 0) cy.remove(toRemove)
+      if (toAdd.length > 0) cy.add(toAdd)
 
-    const layout = cy.layout({
-      name: "concentric",
-      concentric: (node: any) => node.data("depth"),
-      levelWidth: () => 1,
-      minNodeSpacing: 80,
-      padding: 60,
-      animate: true,
-      animationDuration: 500,
-      animationEasing: "ease-out",
-      fit: true,
-    })
-    layout.run()
+      const hasNewOrRemoved = toAdd.length > 0 || toRemove.length > 0
 
-    cy.nodes().forEach((node) => {
-      const depth: number = node.data("depth")
-      node.style("background-color", depthColors[depth] || "#a8a29e")
-    })
-  }, [filteredElements])
+      if (hasNewOrRemoved) {
+        cy.layout({
+          name: "cose",
+          animate: true,
+          animationDuration: 600,
+          animationEasing: "ease-out",
+          nodeRepulsion: () => 15000,
+          nodeOverlap: 4,
+          idealEdgeLength: () => 160,
+          edgeElasticity: () => 100,
+          gravity: 0.5,
+          numIter: 300,
+          initialTemp: 400,
+          coolingFactor: 0.99,
+          minTemp: 1,
+          fit: false,
+        }).run()
+      }
+
+      cy.nodes().forEach((node) => {
+        const d: number = node.data("depth")
+        const isRoot: boolean = node.data("isRoot")
+        if (isRoot) return
+        node.style("border-color", depthColors[d] || "#a8a29e")
+      })
+    } catch (err) {
+      console.error("[GRAPH-VIEW] Update error:", err)
+    }
+  }, [graphElements])
 
   return (
     <div
